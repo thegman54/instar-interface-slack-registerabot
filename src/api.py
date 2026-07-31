@@ -234,9 +234,13 @@ def _fetch_slack_files(files: list) -> list:
 
 # --- multi-tenant control plane (instar connects/disconnects us per profile) --
 def _set_active_bot(bot: str | None):
-    """Point (or unpoint) the adapter at a bot slug (from the profile) and force the relay to
-    reconnect. Our service identity never changes — only which bot we route to."""
+    """Point (or unpoint) the adapter at a bot slug (from the profile). Only force a reconnect
+    when the bot actually CHANGES — the gatekeeper keepalive re-calls connect on every cycle
+    with the same bot, and churning the socket each time would drop the connection for ~2s
+    (during which a message would wrongly get 'No bot connected')."""
     global _active_bot
+    if bot == _active_bot:
+        return  # no change — leave the live socket alone
     _active_bot = bot
     if _relay_loop and _relay_ws is not None:
         # Close the current socket so _relay_client reconnects with the new bot (or idles).
