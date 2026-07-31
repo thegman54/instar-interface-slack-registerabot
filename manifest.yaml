@@ -1,0 +1,21 @@
+name: slack_registerabot
+display_name: Slack (via RegisterABot)
+description: Thin Slack adapter — receives Slack messages + files via Socket Mode and pipes them to the bot over the RegisterABot relay as a service client. No gatekeeper contact.
+type: interface
+category: Interfaces
+icon: slack
+version: 0.1.0
+
+credentials:
+  - key: SLACK_BOT_TOKEN
+    description: Slack bot token (xoxb-…) — receive events + download url_private files
+  - key: SLACK_APP_TOKEN
+    description: Slack app-level token (xapp-…) for Socket Mode
+  - key: REGISTERABOT_RELAY_URL
+    description: RegisterABot relay base URL (wss://…)
+  - key: SLACK_REGISTERABOT_TOKEN
+    description: This adapter's RegisterABot service API key (its relay identity)
+  - key: REGISTERABOT_BOT_SLUG
+    description: Target bot slug on the relay
+  - key: REGISTERABOT_SERVICE_SLUG
+    description: This adapter's service slug on the relay (default slack-adapter)

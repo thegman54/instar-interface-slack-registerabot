@@ -1,0 +1,16 @@
+# Slack → RegisterABot thin adapter. Outbound-only (Socket Mode + relay WS) — no ports.
+# Creds are injected from Infisical by the instar stack manager.
+services:
+  slack-registerabot:
+    build: .
+    container_name: slack-registerabot
+    restart: unless-stopped
+    environment:
+      # Slack (receive + fetch files)
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      # RegisterABot relay (this adapter's own identity)
+      - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL}
+      - REGISTERABOT_SERVICE_SLUG=${REGISTERABOT_SERVICE_SLUG:-slack-adapter}
+      - SLACK_REGISTERABOT_TOKEN=${SLACK_REGISTERABOT_TOKEN}
+      - REGISTERABOT_BOT_SLUG=${REGISTERABOT_BOT_SLUG}
