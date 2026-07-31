@@ -7,14 +7,20 @@ gatekeeper/bot directly; the relay routes to the bot, and the bot-side registera
 extracts the attachments and runs the on_file barrier.
 
 Two creds (both injected from Infisical by the stack):
-  - Slack: SLACK_BOT_TOKEN + SLACK_APP_TOKEN — to receive events and to download dropped
-    files (Slack files sit behind url_private; only the Slack token can fetch them).
+  - Slack: SLACK_BOT_TOKEN + SLACK_APP_TOKEN — to receive events, download dropped files
+    (Slack files sit behind url_private; only the Slack token can fetch them), and upload the
+    bot's outbound files/audio/video back into the thread.
   - Relay: SLACK_REGISTERABOT_TOKEN — this adapter's identity ON the relay.
 
 Protocol (registerabot SDK): connect wss://relay/ws/service/{serviceSlug}?key=…&bot=…,
 send {type:"chat_request", session_id, from:{kind:service}, to:{kind:bot}, payload:
-JSON({messages:[{role,content}], user_context, attachments})}, receive {type:"final_response",
-session_id, payload:JSON({reply})}. Correlate request↔reply by session_id.
+JSON({messages:[{role,content,attachments}], user_context})}. The relay routes EVERY bot→
+service frame (final_response, audio, video, idle) back by session_id, so we keep a
+session_id → {channel, thread_ts} map and dispatch each frame to the right thread:
+  - final_response  → post reply text, upload any `attachments` + embedded `audio`
+  - video           → upload the talking-head mp4 (audio baked in; plays inline in Slack)
+  - audio           → ignored (already embedded in final_response; avoids double audio)
+  - idle            → ignored (a browser-only looping avatar; meaningless in Slack)
 """
 
 import asyncio
@@ -42,17 +48,95 @@ RELAY_URL = os.environ.get("REGISTERABOT_RELAY_URL", "").rstrip("/")   # wss://r
 SERVICE_SLUG = os.environ.get("REGISTERABOT_SERVICE_SLUG", "slack-adapter")
 SERVICE_KEY = os.environ.get("SLACK_REGISTERABOT_TOKEN", "")           # relay identity
 BOT_SLUG = os.environ.get("REGISTERABOT_BOT_SLUG", "")
-REPLY_TIMEOUT = int(os.environ.get("REPLY_TIMEOUT", "300"))
+SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))   # keep dest mapping for trailing frames
 
 # --- relay websocket state (one persistent service connection) ----------------
 _relay_ws = None
 _relay_loop: asyncio.AbstractEventLoop | None = None
-_pending: dict[str, asyncio.Future] = {}   # session_id -> future awaiting final_response
 _bot_user_id: str | None = None
+# session_id -> {"channel", "thread_ts", "ts"} — where to post this turn's frames
+_sessions: dict[str, dict] = {}
+
+
+def _prune_sessions():
+    cutoff = time.time() - SESSION_TTL
+    for sid in [s for s, v in _sessions.items() if v.get("ts", 0) < cutoff]:
+        _sessions.pop(sid, None)
+
+
+# --- Slack posting (blocking SDK calls → run off the relay loop) --------------
+def _post_text(channel: str, thread_ts: str, text: str):
+    try:
+        slack_app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+    except Exception as e:
+        log.warning("slack_post_failed", error=str(e))
+
+
+def _upload_file(channel: str, thread_ts: str, data: bytes, filename: str, title: str = ""):
+    """Upload bytes as a real Slack file. Slack renders mp3/mp4 with an inline player."""
+    try:
+        slack_app.client.files_upload_v2(channel=channel, thread_ts=thread_ts,
+                                         content=data, filename=filename, title=title or filename)
+        log.info("slack_file_uploaded", filename=filename, bytes=len(data))
+    except Exception as e:
+        log.warning("slack_upload_failed", filename=filename, error=str(e))
+
+
+def _b64(x: str) -> bytes | None:
+    try:
+        return base64.b64decode(x)
+    except Exception:
+        return None
+
+
+async def _dispatch_frame(env: dict):
+    """A bot→service frame arrived on the relay. Post it into the mapped Slack thread."""
+    sid = env.get("session_id")
+    dest = _sessions.get(sid)
+    if not dest:
+        return
+    channel, thread = dest["channel"], dest["thread_ts"]
+    ftype = env.get("type")
+    loop = asyncio.get_running_loop()
+
+    if ftype == "final_response":
+        try:
+            payload = json.loads(env.get("payload") or "{}")
+        except Exception:
+            payload = {}
+        reply = payload.get("reply") or ""
+        if reply:
+            await loop.run_in_executor(None, _post_text, channel, thread, reply)
+        # outbound files the bot attached (e.g. the exported CSV)
+        for a in payload.get("attachments") or []:
+            if a.get("type") == "audio":
+                continue
+            data = _b64(a.get("data", "")) if a.get("encoding") == "base64" else \
+                (a.get("data", "").encode() if a.get("data") else None)
+            if data:
+                await loop.run_in_executor(None, _upload_file, channel, thread, data,
+                                           a.get("name", "file"), a.get("name", ""))
+        # embedded voice audio (mp3) — only present when no talking-head video for this turn
+        audio = payload.get("audio") or {}
+        adata = _b64(audio.get("base64", "")) if audio.get("base64") else None
+        if adata:
+            await loop.run_in_executor(None, _upload_file, channel, thread, adata,
+                                       "voice.mp3", "Voice")
+
+    elif ftype == "video":
+        try:
+            payload = json.loads(env.get("payload") or "{}")
+        except Exception:
+            payload = {}
+        vdata = _b64(payload.get("base64", "")) if payload.get("base64") else None
+        if vdata:
+            await loop.run_in_executor(None, _upload_file, channel, thread, vdata,
+                                       "avatar.mp4", "Avatar")
+    # 'audio' (duplicate of embedded) and 'idle' frames are intentionally ignored.
 
 
 async def _relay_client():
-    """Maintain one persistent service-client WS to the relay; resolve replies by session_id."""
+    """Maintain one persistent service-client WS to the relay; dispatch every bot frame."""
     global _relay_ws
     url = f"{RELAY_URL}/ws/service/{SERVICE_SLUG}?key={SERVICE_KEY}&bot={BOT_SLUG}"
     while True:
@@ -65,14 +149,11 @@ async def _relay_client():
                         env = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    if env.get("type") == "final_response":
-                        sid = env.get("session_id")
-                        fut = _pending.pop(sid, None)
-                        if fut and not fut.done():
-                            try:
-                                fut.set_result(json.loads(env.get("payload") or "{}"))
-                            except Exception:
-                                fut.set_result({})
+                    if env.get("session_id"):
+                        try:
+                            await _dispatch_frame(env)
+                        except Exception as e:
+                            log.warning("dispatch_error", error=str(e))
         except Exception as e:
             log.warning("relay_disconnected", error=str(e))
         finally:
@@ -80,11 +161,10 @@ async def _relay_client():
         await asyncio.sleep(5)  # reconnect
 
 
-async def _send_to_bot(text: str, user_id: str, attachments: list) -> dict | None:
-    """Send one chat_request over the relay and await the bot's final_response."""
+async def _send_to_bot(sid: str, text: str, user_id: str, attachments: list):
+    """Send one chat_request over the relay. The reply arrives asynchronously as frames."""
     if _relay_ws is None:
-        return None
-    sid = str(uuid.uuid4())
+        return
     envelope = {
         "v": 1, "type": "chat_request", "session_id": sid,
         "timestamp": int(time.time() * 1000),
@@ -99,15 +179,10 @@ async def _send_to_bot(text: str, user_id: str, attachments: list) -> dict | Non
             "user_context": {"user_id": user_id},
         }),
     }
-    fut = _relay_loop.create_future()
-    _pending[sid] = fut
     try:
         await _relay_ws.send(json.dumps(envelope))
-        return await asyncio.wait_for(fut, timeout=REPLY_TIMEOUT)
     except Exception as e:
-        _pending.pop(sid, None)
         log.warning("send_to_bot_failed", error=str(e))
-        return None
 
 
 def _fetch_slack_files(files: list) -> list:
@@ -152,20 +227,20 @@ def on_slack_message(event, say):
 
     attachments = _fetch_slack_files(files)  # sync, with the Slack token
     user_id = event.get("user", "slack")
+    channel = event.get("channel", "")
+    thread_ts = event.get("thread_ts") or event.get("ts")
 
-    # forward over the relay (on its loop) and wait for the reply
-    result = None
-    if _relay_loop is not None:
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                _send_to_bot(text or "(file attached)", user_id, attachments), _relay_loop)
-            result = future.result(timeout=REPLY_TIMEOUT + 10)
-        except Exception as e:
-            log.warning("relay_roundtrip_failed", error=str(e))
+    if _relay_loop is None or _relay_ws is None:
+        say(text="I couldn't reach the bot right now — try again in a moment.",
+            thread_ts=thread_ts)
+        return
 
-    reply = (result or {}).get("reply") if result else None
-    say(text=reply or "I couldn't reach the bot right now — try again in a moment.",
-        thread_ts=event.get("thread_ts") or event.get("ts"))
+    # Register where this turn's frames should land, then fire the request (non-blocking).
+    sid = str(uuid.uuid4())
+    _prune_sessions()
+    _sessions[sid] = {"channel": channel, "thread_ts": thread_ts, "ts": time.time()}
+    asyncio.run_coroutine_threadsafe(
+        _send_to_bot(sid, text or "(file attached)", user_id, attachments), _relay_loop)
 
 
 def _start_relay_thread():
