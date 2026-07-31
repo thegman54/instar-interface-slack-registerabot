@@ -91,10 +91,12 @@ async def _send_to_bot(text: str, user_id: str, attachments: list) -> dict | Non
         "from": {"kind": "service", "slug": SERVICE_SLUG, "name": "Slack"},
         "to": {"kind": "bot", "slug": BOT_SLUG},
         "encrypted": False,
+        # Attachments go ON THE MESSAGE — the bot-side registerabot connector reads
+        # m.get('attachments') per message and forwards them to /process, which feeds
+        # the on_file barrier. (Top-level payload attachments would be missed.)
         "payload": json.dumps({
-            "messages": [{"role": "user", "content": text}],
+            "messages": [{"role": "user", "content": text, "attachments": attachments}],
             "user_context": {"user_id": user_id},
-            "attachments": attachments,
         }),
     }
     fut = _relay_loop.create_future()
