@@ -1,21 +1,29 @@
 name: slack_registerabot
 display_name: Slack (via RegisterABot)
-description: Thin Slack adapter — receives Slack messages + files via Socket Mode, pipes them to the bot over the RegisterABot relay as a service client, and posts the bot's reply + uploads its outbound files/audio/video back into the thread. No gatekeeper contact.
+description: Thin multi-tenant Slack adapter — receives Slack messages + files via Socket Mode and pipes them to a bot over the RegisterABot relay as a service client (using its OWN service key). The target bot slug comes from the profile that checks this interface. Posts the reply + uploads outbound files/audio/video back into the thread. No gatekeeper contact for messages.
 type: interface
 category: Interfaces
 icon: slack
-version: 0.1.0
+version: "0.2.0"
+tenancy: multi_tenant
+connection:
+  pattern: http
+  port: 8092
+  container_name: slack-registerabot
 
+# The adapter's OWN identity + platform creds (self-fetched from Infisical). NOT the bot slug —
+# that is supplied per-profile via binding_fields below and delivered on /slugs/{bot}/connect.
 credentials:
-  - key: SLACK_BOT_TOKEN
-    description: Slack bot token (xoxb-…) — receive events, download url_private files, and upload outbound files/audio/video (needs files:write scope)
-  - key: SLACK_APP_TOKEN
-    description: Slack app-level token (xapp-…) for Socket Mode
-  - key: REGISTERABOT_RELAY_URL
-    description: RegisterABot relay base URL (wss://…)
-  - key: SLACK_REGISTERABOT_TOKEN
-    description: This adapter's RegisterABot service API key (its relay identity)
-  - key: SLACK_REGISTERABOT_BOT_SLUG
-    description: Which bot to route to on the relay (e.g. seven) — who we send TO
-  - key: SLACK_REGISTERABOT_SERVICE_SLUG
-    description: This adapter's own service slug on the relay (who we speak AS; must match the service record the token belongs to; default slack-adapter)
+  - SLACK_BOT_TOKEN
+  - SLACK_APP_TOKEN
+  - REGISTERABOT_RELAY_URL
+  - SLACK_REGISTERABOT_SERVICE_SLUG
+  - SLACK_REGISTERABOT_TOKEN
+
+# Per-profile binding: which bot this profile routes to (its registerabot slug). This is how
+# the profile hands the adapter its bot slug — the adapter never owns it.
+binding_fields:
+  - name: bot_slug
+    label: Bot Slug (registerabot)
+    type: text
+    required: true
