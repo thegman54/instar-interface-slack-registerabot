@@ -44,10 +44,14 @@ log = structlog.get_logger()
 # --- creds / config (injected from Infisical by the stack) --------------------
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
-RELAY_URL = os.environ.get("REGISTERABOT_RELAY_URL", "").rstrip("/")   # wss://relay…
-SERVICE_SLUG = os.environ.get("REGISTERABOT_SERVICE_SLUG", "slack-adapter")
-SERVICE_KEY = os.environ.get("SLACK_REGISTERABOT_TOKEN", "")           # relay identity
-BOT_SLUG = os.environ.get("REGISTERABOT_BOT_SLUG", "")
+RELAY_URL = os.environ.get("REGISTERABOT_RELAY_URL", "").rstrip("/")   # wss://relay… (shared)
+# Service + bot slugs differ per adapter, so they're SLACK_-prefixed (like the token) to avoid
+# colliding with the Zoom adapter's values in a shared Infisical project. Generic fallbacks kept.
+SERVICE_SLUG = (os.environ.get("SLACK_REGISTERABOT_SERVICE_SLUG")
+                or os.environ.get("REGISTERABOT_SERVICE_SLUG", "slack-adapter"))  # who we speak AS
+SERVICE_KEY = os.environ.get("SLACK_REGISTERABOT_TOKEN", "")           # that service's key
+BOT_SLUG = (os.environ.get("SLACK_REGISTERABOT_BOT_SLUG")
+            or os.environ.get("REGISTERABOT_BOT_SLUG", ""))            # which bot we route TO
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))   # keep dest mapping for trailing frames
 
 # --- relay websocket state (one persistent service connection) ----------------

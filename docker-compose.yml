@@ -9,8 +9,9 @@ services:
       # Slack (receive + fetch files)
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
-      # RegisterABot relay (this adapter's own identity)
+      # RegisterABot relay. RELAY_URL is shared; service+bot slugs are SLACK_-prefixed because
+      # they differ from the Zoom adapter (service = who we speak as, bot = who we route to).
       - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL}
-      - REGISTERABOT_SERVICE_SLUG=${REGISTERABOT_SERVICE_SLUG:-slack-adapter}
+      - SLACK_REGISTERABOT_SERVICE_SLUG=${SLACK_REGISTERABOT_SERVICE_SLUG:-slack-adapter}
       - SLACK_REGISTERABOT_TOKEN=${SLACK_REGISTERABOT_TOKEN}
-      - REGISTERABOT_BOT_SLUG=${REGISTERABOT_BOT_SLUG}
+      - SLACK_REGISTERABOT_BOT_SLUG=${SLACK_REGISTERABOT_BOT_SLUG}

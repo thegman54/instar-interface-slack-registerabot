@@ -15,7 +15,7 @@ credentials:
     description: RegisterABot relay base URL (wss://…)
   - key: SLACK_REGISTERABOT_TOKEN
     description: This adapter's RegisterABot service API key (its relay identity)
-  - key: REGISTERABOT_BOT_SLUG
-    description: Target bot slug on the relay
-  - key: REGISTERABOT_SERVICE_SLUG
-    description: This adapter's service slug on the relay (default slack-adapter)
+  - key: SLACK_REGISTERABOT_BOT_SLUG
+    description: Which bot to route to on the relay (e.g. seven) — who we send TO
+  - key: SLACK_REGISTERABOT_SERVICE_SLUG
+    description: This adapter's own service slug on the relay (who we speak AS; must match the service record the token belongs to; default slack-adapter)
