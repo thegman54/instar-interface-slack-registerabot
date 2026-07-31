@@ -89,6 +89,30 @@ def _b64(x: str) -> bytes | None:
         return None
 
 
+async def _resolve_bytes(item: dict) -> bytes | None:
+    """Get the bytes for a media item, whichever form the relay delivered:
+      - inline base64 (`data`/`base64`/`audio_base64`) — small items the relay kept inline
+      - a hosted ref (`url`) — the relay stored it (TTL ~10 min); fetch to materialize
+    Slack wants the actual file (for an inline player), so we pull the bytes either way."""
+    for k in ("data", "base64", "audio_base64"):
+        v = item.get(k)
+        if v:
+            b = _b64(v)
+            if b is not None:
+                return b
+    url = item.get("url")
+    if url:
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(url, timeout=30)
+            if r.status_code == 200:
+                return r.content
+            log.warning("ref_fetch_status", url=url, status=r.status_code)
+        except Exception as e:
+            log.warning("ref_fetch_failed", url=url, error=str(e))
+    return None
+
+
 async def _dispatch_frame(env: dict):
     """A bot→service frame arrived on the relay. Post it into the mapped Slack thread."""
     sid = env.get("session_id")
@@ -98,12 +122,12 @@ async def _dispatch_frame(env: dict):
     channel, thread = dest["channel"], dest["thread_ts"]
     ftype = env.get("type")
     loop = asyncio.get_running_loop()
+    try:
+        payload = json.loads(env.get("payload") or "{}")
+    except Exception:
+        payload = {}
 
     if ftype == "final_response":
-        try:
-            payload = json.loads(env.get("payload") or "{}")
-        except Exception:
-            payload = {}
         reply = payload.get("reply") or ""
         if reply:
             await loop.run_in_executor(None, _post_text, channel, thread, reply)
@@ -111,24 +135,21 @@ async def _dispatch_frame(env: dict):
         for a in payload.get("attachments") or []:
             if a.get("type") == "audio":
                 continue
-            data = _b64(a.get("data", "")) if a.get("encoding") == "base64" else \
-                (a.get("data", "").encode() if a.get("data") else None)
+            data = await _resolve_bytes(a)
             if data:
-                await loop.run_in_executor(None, _upload_file, channel, thread, data,
-                                           a.get("name", "file"), a.get("name", ""))
+                name = a.get("name", "file")
+                await loop.run_in_executor(None, _upload_file, channel, thread, data, name, name)
         # embedded voice audio (mp3) — only present when no talking-head video for this turn
         audio = payload.get("audio") or {}
-        adata = _b64(audio.get("base64", "")) if audio.get("base64") else None
-        if adata:
-            await loop.run_in_executor(None, _upload_file, channel, thread, adata,
-                                       "voice.mp3", "Voice")
+        if audio:
+            adata = await _resolve_bytes(audio)
+            if adata:
+                await loop.run_in_executor(None, _upload_file, channel, thread, adata,
+                                           "voice.mp3", "Voice")
 
     elif ftype == "video":
-        try:
-            payload = json.loads(env.get("payload") or "{}")
-        except Exception:
-            payload = {}
-        vdata = _b64(payload.get("base64", "")) if payload.get("base64") else None
+        # {format:'mp4', url|base64} — upload the talking-head clip; Slack plays it inline.
+        vdata = await _resolve_bytes(payload)
         if vdata:
             await loop.run_in_executor(None, _upload_file, channel, thread, vdata,
                                        "avatar.mp4", "Avatar")
