@@ -29,7 +29,6 @@ import json
 import os
 import threading
 import time
-import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
@@ -66,6 +65,24 @@ def _prune_sessions():
     cutoff = time.time() - SESSION_TTL
     for sid in [s for s, v in _sessions.items() if v.get("ts", 0) < cutoff]:
         _sessions.pop(sid, None)
+
+
+def _session_key(channel: str, user_id: str, thread_ts: str | None) -> str:
+    """STABLE conversation key — never a fresh uuid per message.
+
+    session_id becomes the gatekeeper's conversation_id (`registerabot:{sid}`), which is what
+    groups multi-turn context AND what counts against a bot's session budget. Minting a uuid
+    per message meant every Slack line started a brand-new conversation: no memory of the last
+    turn, and the bot's session count drained one message at a time.
+
+    Keying:
+      - a reply inside a real thread  -> per-THREAD  (everyone in the thread shares context)
+      - a top-level message           -> per-USER in that channel/DM (Alex and Ross each get
+        their own rolling conversation instead of colliding or forking every message)
+    """
+    if thread_ts:
+        return f"slack-{channel}-t{thread_ts}"
+    return f"slack-{channel}-u{user_id}"
 
 
 # --- Slack posting (blocking SDK calls → run off the relay loop) --------------
@@ -317,7 +334,7 @@ def on_slack_message(event, say):
     user_id = event.get("user", "slack")
     channel = event.get("channel", "")
 
-    sid = str(uuid.uuid4())
+    sid = _session_key(channel, user_id, event.get("thread_ts"))
     _prune_sessions()
     _sessions[sid] = {"channel": channel, "thread_ts": thread_ts, "ts": time.time()}
     asyncio.run_coroutine_threadsafe(
