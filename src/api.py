@@ -165,8 +165,17 @@ async def _dispatch_frame(env: dict):
     elif ftype == "video":
         vdata = await _resolve_bytes(payload)
         if vdata:
+            # A turn may arrive as several clips (payload carries seq/final — see the
+            # chunked renderer). Slack has no way to stitch them, so they land as separate
+            # files; number them or they all show up as an indistinguishable "avatar.mp4"
+            # and the reader can't tell what order to play them in.
+            seq = payload.get("seq")
+            final = payload.get("final", True)
+            chunked = seq is not None and not (seq == 0 and final)
+            name = f"avatar-{int(seq) + 1}.mp4" if chunked else "avatar.mp4"
+            label = f"Avatar ({int(seq) + 1})" if chunked else "Avatar"
             await loop.run_in_executor(None, _upload_file, channel, thread, vdata,
-                                       "avatar.mp4", "Avatar")
+                                       name, label)
     # 'audio' (duplicate of embedded) and 'idle' frames are intentionally ignored.
 
 
