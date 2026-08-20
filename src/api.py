@@ -52,13 +52,84 @@ SERVICE_KEY = os.environ.get("SLACK_REGISTERABOT_TOKEN", "")           # our ser
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8092"))   # instar multi-tenant connect/disconnect
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))
 
+# How long a transport may stay down before the watchdog kills the process so
+# `restart: unless-stopped` brings up a clean one. An unhealthy healthcheck does NOT
+# restart a container by itself — reporting a fault is not recovering from it. On
+# 2026-08-19 this adapter sat "healthy" for ~7h with a dead Slack socket, receiving
+# nothing. Long enough to ride out ordinary reconnects, short enough to not lose a morning.
+WATCHDOG_GRACE = int(os.environ.get("WATCHDOG_GRACE", "180"))
+
 # --- relay + routing state ----------------------------------------------------
 _relay_ws = None
 _relay_loop: asyncio.AbstractEventLoop | None = None
 _bot_user_id: str | None = None
 _active_bot: str | None = None            # which bot we route TO — comes from the profile
+_socket_handler = None                    # SocketModeHandler — the ONLY inbound path from Slack
+_relay_down_since: float | None = None    # when the relay WS dropped (None = up, or idle by design)
 # session_id -> {"channel", "thread_ts", "ts"} — where to post this turn's frames
 _sessions: dict[str, dict] = {}
+
+
+def _slack_connected() -> bool:
+    """Is the Socket Mode connection actually up?
+
+    This is the ONLY way Slack messages reach us. `SocketModeHandler.client.is_connected()`
+    reflects the live WebSocket, not the fact that a process is running and a port is open —
+    which is the distinction that matters and the one the old healthcheck missed entirely.
+    """
+    try:
+        return bool(_socket_handler and _socket_handler.client.is_connected())
+    except Exception:
+        return False
+
+
+def _health() -> tuple[bool, dict]:
+    """(ok, detail). Unhealthy means messages cannot flow, in either direction.
+
+    - Slack socket down  -> nothing can reach us. Always unhealthy.
+    - Relay down WITH an active bot -> we can hear but cannot answer. Unhealthy.
+    - Relay idle with no bot connected -> correct behaviour, not a fault.
+    """
+    slack_ok = _slack_connected()
+    relay_ok = _relay_ws is not None
+    idle = _active_bot is None
+    ok = slack_ok and (relay_ok or idle)
+    detail = {
+        "status": "ok" if ok else "degraded",
+        "service": SERVICE_SLUG,
+        "active_bot": _active_bot,
+        "slack_socket": "connected" if slack_ok else "disconnected",
+        "relay": "connected" if relay_ok else ("idle" if idle else "disconnected"),
+    }
+    if not ok:
+        detail["reason"] = ("slack socket mode is down — no messages can arrive"
+                            if not slack_ok else
+                            f"relay is down while bot '{_active_bot}' is connected — cannot reply")
+    return ok, detail
+
+
+def _watchdog():
+    """Kill the process when a transport stays down past the grace period.
+
+    Docker does not restart an unhealthy container; `restart: unless-stopped` only reacts to
+    the process EXITING. So recovery has to be an exit. Both transports self-heal on their own
+    first — this only fires when that has demonstrably failed for WATCHDOG_GRACE seconds.
+    """
+    down_since: float | None = None
+    while True:
+        time.sleep(15)
+        ok, detail = _health()
+        if ok:
+            down_since = None
+            continue
+        now = time.time()
+        if down_since is None:
+            down_since = now
+            log.warning("transport_down", **detail)
+            continue
+        if now - down_since >= WATCHDOG_GRACE:
+            log.error("watchdog_restart", down_for=int(now - down_since), **detail)
+            os._exit(1)   # hard exit: the supervisor gives us a clean process
 
 
 def _prune_sessions():
@@ -183,7 +254,7 @@ async def _relay_client():
     """Maintain the service-client WS to the relay for whichever bot the profile connected us
     to. We authenticate with OUR OWN service slug + key; the bot slug is the profile's.
     Reconnects when _active_bot changes (connect/disconnect close the socket)."""
-    global _relay_ws
+    global _relay_ws, _relay_down_since
     while True:
         bot = _active_bot
         if not bot:
@@ -193,6 +264,7 @@ async def _relay_client():
         try:
             async with websockets.connect(url, max_size=None) as ws:
                 _relay_ws = ws
+                _relay_down_since = None
                 log.info("relay_connected", service=SERVICE_SLUG, bot=bot)
                 async for raw in ws:
                     if _active_bot != bot:   # profile re-pointed us — drop and reconnect
@@ -210,6 +282,8 @@ async def _relay_client():
             log.warning("relay_disconnected", error=str(e))
         finally:
             _relay_ws = None
+            if _relay_down_since is None:
+                _relay_down_since = time.time()
         await asyncio.sleep(2)
 
 
@@ -283,8 +357,10 @@ class _Control(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/health", "/status"):
-            return self._reply(200, {"status": "ok", "service": SERVICE_SLUG,
-                                     "active_bot": _active_bot})
+            # 503 when messages cannot flow. A 200 here used to mean nothing more than
+            # "the control server is listening", which is true of a completely deaf adapter.
+            ok, detail = _health()
+            return self._reply(200 if ok else 503, detail)
         self._reply(404, {"error": "not found"})
 
     def do_POST(self):
@@ -358,7 +434,7 @@ def _start_relay_thread():
 
 
 def main():
-    global _bot_user_id
+    global _bot_user_id, _socket_handler
     # Required: Slack platform creds, relay URL, and OUR OWN service key (SLACK_REGISTERABOT_TOKEN).
     # The bot slug is NOT required — it arrives from the profile via /slugs/{bot}/connect.
     missing = [k for k, v in {
@@ -375,8 +451,11 @@ def main():
 
     threading.Thread(target=_start_relay_thread, daemon=True).start()
     threading.Thread(target=_start_control_server, daemon=True).start()
-    log.info("slack_registerabot_adapter_starting", service=SERVICE_SLUG, control_port=CONTROL_PORT)
-    SocketModeHandler(slack_app, SLACK_APP_TOKEN).start()  # blocks
+    threading.Thread(target=_watchdog, daemon=True).start()
+    log.info("slack_registerabot_adapter_starting", service=SERVICE_SLUG,
+             control_port=CONTROL_PORT, watchdog_grace=WATCHDOG_GRACE)
+    _socket_handler = SocketModeHandler(slack_app, SLACK_APP_TOKEN)
+    _socket_handler.start()  # blocks
 
 
 if __name__ == "__main__":

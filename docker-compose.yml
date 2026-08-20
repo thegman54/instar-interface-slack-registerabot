@@ -14,11 +14,16 @@ services:
       - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-prod}
       - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL:-wss://relay.registerabot.com}
       - CONTROL_PORT=8092
+    # /health returns 503 when the Slack socket is down (or when the relay is down while a bot
+    # is connected), so `curl -f` fails and the container reports unhealthy. Note docker does
+    # NOT restart an unhealthy container — recovery comes from the in-process watchdog exiting,
+    # which `restart: unless-stopped` then acts on. This healthcheck is for VISIBILITY.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8092/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 60s
     restart: unless-stopped
     networks:
       - instar-internal
