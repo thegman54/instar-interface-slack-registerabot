@@ -1,10 +1,10 @@
 name: slack_registerabot
 display_name: Slack (via RegisterABot)
-description: Thin multi-tenant Slack adapter — receives Slack messages + files via Socket Mode and pipes them to a bot over the RegisterABot relay as a service client (using its OWN service key). The target bot slug comes from the profile that checks this interface. Posts the reply + uploads outbound files/audio/video back into the thread. No gatekeeper contact for messages.
+description: Thin multi-tenant Slack adapter — receives Slack messages + files via Socket Mode and pipes them to a bot over the RegisterABot relay as a service client (using its OWN service key). The target bot slug comes from the profile that checks this interface. Posts the reply + uploads outbound files/audio/video back into the thread. Also exposes POST /outbound so a bot can open a cold DM with a workspace member (optionally with a native Slack call block). No gatekeeper contact for messages.
 type: interface
 category: Interfaces
 icon: slack
-version: "0.2.0"
+version: "0.3.0"
 tenancy: multi_tenant
 connection:
   pattern: http

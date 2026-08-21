@@ -16,6 +16,13 @@ gatekeeper calls POST /slugs/{bot_slug}/connect (the standard multi-tenant inter
 that's how the profile hands us its registerabot bot slug; on stop, /slugs/{bot}/disconnect.
 There is deliberately no BOT_SLUG in this adapter's config.
 
+Two directions:
+  - INBOUND  — Socket Mode event -> relay chat_request -> bot; frames come back and get
+    posted into the mapped thread.
+  - OUTBOUND — POST /outbound on the control plane opens a DM with someone the bot has never
+    spoken to and posts into it (optionally with a native call block). Reachable only from
+    instar-internal, i.e. via tool-executor; the bot cannot call it directly.
+
 Creds (from Infisical):
   - Slack: SLACK_BOT_TOKEN + SLACK_APP_TOKEN — receive events, download url_private files,
     upload outbound files/audio/video.
@@ -29,7 +36,8 @@ import json
 import os
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import structlog
@@ -332,6 +340,135 @@ def _fetch_slack_files(files: list) -> list:
     return out
 
 
+# --- outbound: start a conversation Slack-side instead of only answering one ----
+def _resolve_recipient(target: str) -> tuple[str, str]:
+    """A human-supplied recipient -> (channel_id, user_id).
+
+    Accepts, in order of directness:
+      - a channel/DM id (C…/D…/G…) -> used as-is, user_id unknown ("")
+      - a user id (U…/W…)          -> conversations.open to get the DM channel
+      - an email                   -> users.lookupByEmail  (needs users:read.email)
+      - a name / @name             -> scan users.list      (needs users:read)
+
+    conversations.open is what makes a COLD dm possible: it creates the DM channel with
+    someone the bot has never spoken to. Posting to a raw U… id also works, but opening
+    explicitly gives us the real channel id to key the session on.
+    """
+    t = (target or "").strip().lstrip("@")
+    if not t:
+        raise ValueError("no recipient")
+
+    if t[0] in ("C", "D", "G") and t[1:].isalnum() and t.isupper():
+        return t, ""
+
+    user_id = ""
+    if t[0] in ("U", "W") and t.isupper() and t[1:].isalnum():
+        user_id = t
+    elif "@" in t and "." in t.split("@")[-1]:
+        user_id = slack_app.client.users_lookupByEmail(email=t)["user"]["id"]
+    else:
+        needle = t.lower()
+        cursor = None
+        while True:
+            page = slack_app.client.users_list(limit=200, cursor=cursor)
+            for u in page.get("members", []):
+                if u.get("deleted") or u.get("is_bot"):
+                    continue
+                prof = u.get("profile") or {}
+                names = {u.get("name", ""), u.get("real_name", ""),
+                         prof.get("display_name", ""), prof.get("real_name", "")}
+                if needle in {n.lower() for n in names if n}:
+                    user_id = u["id"]
+                    break
+            if user_id:
+                break
+            cursor = (page.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                raise ValueError(f"no Slack user matches '{target}'")
+
+    channel = slack_app.client.conversations_open(users=user_id)["channel"]["id"]
+    return channel, user_id
+
+
+def _post_call_block(channel: str, join_url: str, title: str) -> str | None:
+    """Mint a Slack call object and post it as a native call block. Returns the call id.
+
+    calls.add only CREATES the object — it rings nobody and delivers nothing. The message
+    below is the entire notification. Slack has no API to start or join a huddle, so this
+    block plus our own media path is as close as a bot gets to calling someone.
+    """
+    call = slack_app.client.calls_add(
+        external_unique_id=uuid.uuid4().hex,
+        join_url=join_url,
+        created_by=_bot_user_id,
+        title=title or "Call",
+    )
+    call_id = call["call"]["id"]
+    slack_app.client.chat_postMessage(
+        channel=channel, text=title or "Call",
+        blocks=[{"type": "call", "call_id": call_id}],
+    )
+    return call_id
+
+
+def _outbound(body: dict) -> tuple[int, dict]:
+    """Open a conversation with a Slack user and post to it.
+
+    Everything the adapter did until now was reactive: it could only answer inside a session
+    an inbound message had created. This is the other direction.
+
+    The reply path is unchanged — we seed `_sessions` with the SAME key the inbound handler
+    would compute, so when the human answers, their message lands in this conversation
+    instead of forking a new one.
+    """
+    bot = body.get("bot")
+    if not _active_bot:
+        return 409, {"error": "no bot is connected to this adapter"}
+    if bot and bot != _active_bot:
+        return 409, {"error": f"bot '{bot}' is not the connected bot"}
+
+    text = (body.get("text") or "").strip()
+    join_url = (body.get("join_url") or "").strip()
+    if not text and not join_url:
+        return 400, {"error": "text or join_url is required"}
+
+    try:
+        channel, user_id = _resolve_recipient(body.get("to") or "")
+    except Exception as e:
+        return 400, {"error": f"could not resolve recipient: {e}"}
+
+    result = {"status": "sent", "channel": channel, "user": user_id, "bot": _active_bot}
+    try:
+        if text:
+            posted = slack_app.client.chat_postMessage(channel=channel, text=text)
+            result["ts"] = posted.get("ts")
+        if join_url:
+            try:
+                result["call_id"] = _post_call_block(channel, join_url, body.get("title") or "")
+            except Exception as e:
+                # calls:write missing, or the call object was rejected. A plain link still
+                # gets the human into the room — degrade instead of failing the send.
+                log.warning("calls_add_failed", error=str(e))
+                slack_app.client.chat_postMessage(
+                    channel=channel, text=f"Join: {join_url}")
+                result["call_block"] = f"unavailable ({e}) — posted a plain link"
+    except Exception as e:
+        log.warning("outbound_post_failed", error=str(e))
+        return 502, {"error": f"slack post failed: {e}"}
+
+    # Key it exactly as an inbound top-level message from this user would be keyed, so their
+    # reply continues THIS conversation. thread_ts is left unset: the human answers in the DM
+    # at top level, and the inbound handler will pin the thread when they do.
+    sid = _session_key(channel, user_id or "slack", None)
+    _prune_sessions()
+    _sessions[sid] = {"channel": channel, "thread_ts": result.get("ts"), "ts": time.time()}
+    result["session_id"] = sid
+
+    log.info("outbound_sent", channel=channel, user=user_id, bot=_active_bot,
+             has_call=bool(join_url), session_id=sid)
+    return 200, result
+
+
 # --- multi-tenant control plane (instar connects/disconnects us per profile) --
 def _set_active_bot(bot: str | None):
     """Point (or unpoint) the adapter at a bot slug (from the profile). Only force a reconnect
@@ -363,10 +500,25 @@ class _Control(BaseHTTPRequestHandler):
             return self._reply(200 if ok else 503, detail)
         self._reply(404, {"error": "not found"})
 
+    def _body(self) -> dict:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n)) if n else {}
+        except Exception:
+            return {}
+
     def do_POST(self):
+        parts = [p for p in self.path.split("/") if p]  # ['slugs', '{bot}', 'connect']
+
+        # Outbound is reachable only from instar-internal — the same trust boundary that
+        # already governs connect/disconnect. The bot itself is NOT on that network; it
+        # gets here through mcp-server -> tool-executor, which is the point.
+        if parts == ["outbound"]:
+            code, obj = _outbound(self._body())
+            return self._reply(code, obj)
+
         # The profile hands us ONLY its bot slug (in the path). We authenticate as our own
         # service; the profile's own token is the bot's, not ours, so we ignore any body.
-        parts = [p for p in self.path.split("/") if p]  # ['slugs', '{bot}', 'connect']
         if len(parts) == 3 and parts[0] == "slugs":
             bot, action = parts[1], parts[2]
             try:
@@ -391,7 +543,9 @@ class _Control(BaseHTTPRequestHandler):
 
 
 def _start_control_server():
-    HTTPServer(("0.0.0.0", CONTROL_PORT), _Control).serve_forever()
+    # Threaded: an outbound send makes 2-3 blocking Slack calls, and a single-threaded
+    # server would stall /health behind them long enough to look dead to the healthcheck.
+    ThreadingHTTPServer(("0.0.0.0", CONTROL_PORT), _Control).serve_forever()
 
 
 # --- Slack Socket Mode ---------------------------------------------------------
