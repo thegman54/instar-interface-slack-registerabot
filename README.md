@@ -20,7 +20,7 @@ message created. `POST /outbound` on the control plane (`:8092`) is the other di
 ```
 POST http://slack-registerabot:8092/outbound
 { "to": "U0123ABC" | "ross@example.com" | "ross" | "C0123CHAN",
-  "text": "My human, Alex Glickman, asked me to pass this along…",
+  "text": "My human asked me to pass this along…",
   "join_url": "https://…",        # optional — adds a native Slack call block
   "title": "Sync with Seven",     # optional — call block title
   "bot": "seven" }                # optional — 409s if it isn't the connected bot
