@@ -35,6 +35,7 @@ import base64
 import json
 import os
 import threading
+import re
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -552,14 +553,21 @@ def _start_control_server():
 slack_app = App(token=SLACK_BOT_TOKEN)
 
 
-@slack_app.event("message")
-def on_slack_message(event, say):
+def _handle_incoming(event, say):
+    """One path for a human message, whichever event carried it.
+
+    Shared by `message` and `app_mention` rather than duplicated. The two events overlap
+    confusingly — a mention in a channel the app can read arrives as BOTH — and two copies of
+    this logic would drift into answering one and not the other.
+    """
     if event.get("bot_id") or event.get("user") == _bot_user_id:
         return
     if event.get("subtype") in ("message_changed", "message_deleted", "channel_join"):
         return
 
-    text = (event.get("text") or "").strip()
+    # Strip the leading @bot. Slack delivers "<@U0AFXK4SXSL> do the thing", and passing the
+    # raw id through means the bot reads its own user id as the first word of every request.
+    text = re.sub(r"<@[A-Z0-9]+>", "", event.get("text") or "").strip()
     files = event.get("files", [])
     if not text and not files:
         return
@@ -576,8 +584,28 @@ def on_slack_message(event, say):
     sid = _session_key(channel, user_id, event.get("thread_ts"))
     _prune_sessions()
     _sessions[sid] = {"channel": channel, "thread_ts": thread_ts, "ts": time.time()}
+    log.info("slack_message_received", channel=channel, user=user_id,
+             chars=len(text), files=len(files))
     asyncio.run_coroutine_threadsafe(
         _send_to_bot(sid, text or "(file attached)", user_id, attachments), _relay_loop)
+
+
+@slack_app.event("message")
+def on_slack_message(event, say):
+    _handle_incoming(event, say)
+
+
+# Channel messages need `channels:history`, which this app does NOT have — it has only
+# `im:history`, so a message posted in a channel never reaches the handler above and simply
+# vanishes. `app_mentions:read` IS granted, and an @mention arrives as its own event type,
+# which nothing was listening for.
+#
+# So without this handler, being @mentioned in a channel did nothing at all and looked
+# identical to the bot being down. Adding it makes channel mentions work with the scopes
+# already granted, rather than waiting on a Slack app reinstall.
+@slack_app.event("app_mention")
+def on_slack_app_mention(event, say):
+    _handle_incoming(event, say)
 
 
 def _start_relay_thread():
