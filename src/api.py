@@ -299,6 +299,12 @@ async def _relay_client():
 async def _send_to_bot(sid: str, text: str, user_id: str, attachments: list):
     """Send one chat_request over the relay to the currently-connected bot."""
     if _relay_ws is None or not _active_bot:
+        # Was a silent return. A Slack message would arrive, hit this line, and vanish with no
+        # log anywhere — indistinguishable from the bot being down, and the cause of an hour
+        # spent looking at Slack scopes when the break was here.
+        log.warning("send_to_bot_skipped",
+                    reason="no relay socket" if _relay_ws is None else "no active bot",
+                    active_bot=_active_bot, session=sid, chars=len(text))
         return
     envelope = {
         "v": 1, "type": "chat_request", "session_id": sid,
@@ -315,8 +321,10 @@ async def _send_to_bot(sid: str, text: str, user_id: str, attachments: list):
     }
     try:
         await _relay_ws.send(json.dumps(envelope))
+        log.info("sent_to_bot", bot=_active_bot, session=sid, chars=len(text),
+                 attachments=len(attachments or []))
     except Exception as e:
-        log.warning("send_to_bot_failed", error=str(e))
+        log.warning("send_to_bot_failed", error=str(e), bot=_active_bot, session=sid)
 
 
 def _fetch_slack_files(files: list) -> list:
@@ -586,8 +594,24 @@ def _handle_incoming(event, say):
     _sessions[sid] = {"channel": channel, "thread_ts": thread_ts, "ts": time.time()}
     log.info("slack_message_received", channel=channel, user=user_id,
              chars=len(text), files=len(files))
-    asyncio.run_coroutine_threadsafe(
+    if _relay_loop is None:
+        log.error("relay_loop_missing", session=sid,
+                  hint="the relay thread never started; nothing can be forwarded")
+        say(text="I received that but my transport is not running — nothing was sent.",
+            thread_ts=thread_ts)
+        return
+
+    fut = asyncio.run_coroutine_threadsafe(
         _send_to_bot(sid, text or "(file attached)", user_id, attachments), _relay_loop)
+
+    # Read the Future. Dropping it swallows every exception raised inside the coroutine,
+    # which is how a message could be received, fail to forward, and leave no trace at all.
+    def _report(f):
+        try:
+            f.result()
+        except Exception as exc:
+            log.error("forward_failed", session=sid, error=str(exc)[:200])
+    fut.add_done_callback(_report)
 
 
 @slack_app.event("message")
